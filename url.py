@@ -1,6 +1,6 @@
 import socket
-import requests
 import os
+from playwright.sync_api import sync_playwright
 from extractor import Extractor
 from db_handler import DatabaseHandler
 from datetime import datetime, timedelta, UTC
@@ -8,7 +8,6 @@ from utils import parse_domain, generate_md5
 
 
 class URLHandler:
-    #LOCK_TIMEOUT = timedelta(minutes=10)
 
     def __init__(self):
         self.db_handler = DatabaseHandler()
@@ -17,13 +16,22 @@ class URLHandler:
     def fetch_html(self, url):
         """Fetches the HTML content of a URL."""
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            response = requests.get(url, timeout=30, headers=headers)
-            return  response.text,response.status_code
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+                page = context.new_page()
 
-        except requests.RequestException as e:
+
+                response = page.goto(url, timeout=30000, wait_until='domcontentloaded')
+                status_code = response.status if response else None
+                html_content = page.content()
+
+                browser.close()
+                return html_content, status_code
+
+        except Exception as e:
             print(f" Error fetching {url}: {e}")
-            return None
+            return None, None
 
     def get_url_list_last_crawled_48hrs_before(self, num_of_urls=100):
         """Retrieve and lock URLs atomically to prevent duplicate pickups."""
@@ -103,8 +111,7 @@ class URLHandler:
                     "html_content":html_content,
                     "Status_code":status_code,
                     "emails": list(set(emails)),
-                    "person_names":names["person_names"],
-                    "company_names": names["company_names"]
+                    "company_names": names["organization"]
                 }}
             )
             print(f" Successfully processed and completed URL: {url['url']}")
