@@ -9,4 +9,4 @@ def main():
     print("Crawling process completed.")
 
 if __name__ == "__main__":
-    main()
+        main()

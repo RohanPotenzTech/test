@@ -1,88 +1,90 @@
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlunparse, urlparse
 import re
-from utils import is_internal_link, parse_domain
+from transformers import pipeline
+from utils import parse_domain
 
+ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", grouped_entities=True)
 class Extractor:
-
-    @staticmethod
-    def normalize_domain(url):
-        """Normalizes a domain to its canonical form.
-        
-        Args:
-            url (str): The URL or domain to normalize
-            
-        Returns:
-            str: The normalized domain (e.g., 'xyz.com' from 'www.xyz.com' or 'https://www.xyz.com/')
-        """
-        return parse_domain(url)
+    
+    def normalize_url(url):
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return urlunparse((parsed.scheme, domain, parsed.path, '', '', ''))
 
     @staticmethod
     def extract_links(html, base_url):
-        """Extracts all internal links from a webpage."""
+        """Extract internal links from HTML based on base_url."""
         soup = BeautifulSoup(html, "html.parser")
-        links = set()
-        base_domain = parse_domain(base_url)
-
+        internal_links = set()
+        external_links = set()
+        
         for a_tag in soup.find_all("a", href=True): 
             href = a_tag["href"].split("#")[0].strip() 
 
-            if not href:
+            if not href or href.lower().startswith(("javascript:", "mailto:", "tel:")):
                 continue
 
             try:
+                # Handle fake relative domains like "xyz.com/a.html"
+                if not href.startswith(("http://", "https://", "/")) and '.' in href.split('/')[0]:
+                    href = "http://" + href
+
                 full_url = urljoin(base_url, href).strip().lower()
-                if is_internal_link(base_url, full_url):
-                    links.add(full_url)
+                normalized = Extractor.normalize_url(full_url)
+                if Extractor.is_internal_link(base_url, full_url):
+                     internal_links.add(normalized)
+                else:
+                    external_links.add(normalized)
             except ValueError:
                 continue  # Skip invalid hrefs
 
-        return links
+        return {
+            "internal": internal_links,
+            "external": external_links
+        }
 
     @staticmethod
     def is_internal_link(base_url, url):
-        """Checks if a URL belongs to the same domain as the base URL."""
-        return is_internal_link(base_url, url)
+        return parse_domain(base_url) == parse_domain(url)
     
     @staticmethod
     def extract_email(html_content):
-        """Extracts email addresses from HTML content."""
         email_regex = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
         return re.findall(email_regex, html_content)
     
     @staticmethod
     def extract_names(html_content):
-        """Extracts organization names from HTML content."""
         soup = BeautifulSoup(html_content, "html.parser")
         
-        # Look for common organization indicators
-        org_patterns = [
-            r'(?i)company\s+name:\s*([A-Za-z0-9\s&.,]+)',
-            r'(?i)organization:\s*([A-Za-z0-9\s&.,]+)',
-            r'(?i)about\s+([A-Za-z0-9\s&.,]+)',
-            r'(?i)welcome\s+to\s+([A-Za-z0-9\s&.,]+)',
-            r'(?i)©\s*(\d{4})\s*([A-Za-z0-9\s&.,]+)',
-            r'(?i)all\s+rights\s+reserved\s+([A-Za-z0-9\s&.,]+)',
-            r'(?i)<title>([^<]+)</title>',
-            r'(?i)<h1[^>]*>([^<]+)</h1>',
-            r'(?i)<h2[^>]*>([^<]+)</h2>',
-            r'(?i)<meta\s+name="description"\s+content="([^"]+)"',
-        ]
-        
-        organizations = set()
-        for pattern in org_patterns:
-            matches = re.findall(pattern, html_content)
-            for match in matches:
-                if isinstance(match, tuple):
-                    # If the pattern has groups, take the organization name group
-                    org_name = match[-1].strip()
-                else:
-                    org_name = match.strip()
-                if org_name:
-                    organizations.add(org_name)
-        
+        relevant_parts = []
+
+        footer = soup.find("footer")
+        if footer:
+            relevant_parts.append(footer.get_text(separator=" ", strip=True))
+
+        # Headings (company names often live in h1/h2 tags)
+        for tag in soup.find_all(["h1", "h2", "h3"]):
+            relevant_parts.append(tag.get_text(separator=" ", strip=True))
+
+        meta_author = soup.find("meta", attrs={"name": "author"})
+        if meta_author and meta_author.get("content"):
+            relevant_parts.append(meta_author["content"])
+
+        # Combine everything into a single string
+        filtered_text = " ".join(relevant_parts)
+
+        entities = ner_pipeline(filtered_text)
+
+        organization = []
+
+        for ent in entities:
+            if ent["entity_group"] == "ORG":
+                organization.append(ent["word"])
         return {
-            "organization": list(organizations)
+            "organization": list(set(organization))
         }
 
 def main():
@@ -90,9 +92,10 @@ def main():
     html_content = """
     <h1>about us</h1> 
     <a href="xyz.com/a.html">a.html</a>
-    <a href="b.html">b.html</a>
-    <a href="c.html">c.html</a>
-    <a href="www.xyz.com/a.html">d.html</a>
+    <a href="/b.html">b.html</a>
+    <a href="/c.html">c.html</a>
+    <a href="www.xyz.com/d.html">d.html</a>
+    <a href="www.pqr.com/e.html">e.html</a>
     <p>Contact us at info@example.com</p>
     <p>Company name: Example Corp</p>
     """
@@ -100,32 +103,14 @@ def main():
     base = "https://xyz.com/index.html"
     result = Extractor.extract_links(html_content, base)
     print("Internal links with base:", base)
-    for link in result:
+    print("Internal links with base:", base)
+    print("\n[Internal Links]")
+    for link in result["internal"]:
         print(link)
-        # Demonstrate domain normalization
-        normalized_domain = Extractor.normalize_domain(link)
-        print(f"  Normalized domain: {normalized_domain}")
 
-    print("-" * 40)
-
-    base_www = "https://www.xyz.com"
-    result_www = Extractor.extract_links(html_content, base_www)
-    print("Internal links with base:", base_www)
-    for link in result_www:
+    print("\n[External Links]")
+    for link in result["external"]:
         print(link)
-        # Demonstrate domain normalization
-        normalized_domain = Extractor.normalize_domain(link)
-        print(f"  Normalized domain: {normalized_domain}")
-    
-    print("-" * 40)
-    
-    # Test email extraction
-    emails = Extractor.extract_email(html_content)
-    print("Extracted emails:", emails)
-    
-    # Test organization name extraction
-    names = Extractor.extract_names(html_content)
-    print("Extracted organization names:", names["organization"])
-    
+      
 if __name__ == "__main__":
     main()
