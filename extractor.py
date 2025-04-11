@@ -59,32 +59,23 @@ class Extractor:
     def extract_names(html_content):
         soup = BeautifulSoup(html_content, "html.parser")
         
-        relevant_parts = []
+        #relevant_parts = []
 
-        footer = soup.find("footer")
-        if footer:
-            relevant_parts.append(footer.get_text(separator=" ", strip=True))
-
-        # Headings (company names often live in h1/h2 tags)
-        for tag in soup.find_all(["h1", "h2", "h3"]):
-            relevant_parts.append(tag.get_text(separator=" ", strip=True))
-
-        meta_author = soup.find("meta", attrs={"name": "author"})
+        """meta_author = soup.find("meta", attrs={"name": "author"})
         if meta_author and meta_author.get("content"):
-            relevant_parts.append(meta_author["content"])
+            relevant_parts.append(meta_author["content"])"""
 
-        # Combine everything into a single string
-        filtered_text = " ".join(relevant_parts)
+        text = soup.get_text(separator=" ", strip=True)
 
-        entities = ner_pipeline(filtered_text)
+        entities = ner_pipeline(text)
 
-        organization = []
+        persons = []
 
         for ent in entities:
-            if ent["entity_group"] == "ORG":
-                organization.append(ent["word"])
+            if ent["entity_group"] in ["PER", "PERSON"]:
+                persons.append(ent["word"])
         return {
-            "organization": list(set(organization))
+            "person_names": list(set(persons))
         }
 
 def main():
@@ -98,12 +89,15 @@ def main():
     <a href="www.pqr.com/e.html">e.html</a>
     <p>Contact us at info@example.com</p>
     <p>Company name: Example Corp</p>
+    <p>Contact John Doe for more info.</p>
+    <p>John Doe is the CEO of Example Corp and has over 20 years of experience in the financial industry.</p>
+    <p>Jane Smith is the CTO and oversees all technical operations.</p>
     """
 
     base = "https://xyz.com/index.html"
     result = Extractor.extract_links(html_content, base)
     print("Internal links with base:", base)
-    print("Internal links with base:", base)
+
     print("\n[Internal Links]")
     for link in result["internal"]:
         print(link)
@@ -111,6 +105,10 @@ def main():
     print("\n[External Links]")
     for link in result["external"]:
         print(link)
+    
+    name_result = Extractor.extract_names(html_content)
+    print("\n[Person Names]")
+    print(name_result["person_names"])
       
 if __name__ == "__main__":
     main()

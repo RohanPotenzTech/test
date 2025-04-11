@@ -6,7 +6,6 @@ from db_handler import DatabaseHandler
 from datetime import datetime, timedelta, UTC
 from utils import parse_domain, generate_md5
 
-
 class URLHandler:
 
     def __init__(self):
@@ -17,21 +16,72 @@ class URLHandler:
     def fetch_html(self, url):
         """Fetches the HTML content of a URL."""
         try:
+            redirect_chain_info = []
+
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 context = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
                 page = context.new_page()
 
+                seen_urls = set()
+
+                def handle_response(response):
+                    req = response.request
+                    if req.resource_type != "document":
+                        return
+                    
+                    redirected_from = req.redirected_from
+
+                    if redirected_from:
+                        orig_url = redirected_from.url
+                        if orig_url not in seen_urls:
+                            seen_urls.add(orig_url)
+                            orig_resp = redirected_from.response()
+                            redirect_chain_info.append({
+                                "url": orig_url,
+                                "status": orig_resp.status if orig_resp else None
+                            })
+
+                    if response.url not in seen_urls:
+                        seen_urls.add(response.url)
+                        redirect_chain_info.append({
+                            "url": response.url,
+                            "status": response.status
+                        })
+
+                page.on("response", handle_response)
+
                 response = page.goto(url, timeout=30000, wait_until='domcontentloaded')
-                status_code = response.status if response else None
                 html_content = page.content()
+                final_url = page.url
+                status_code = response.status if response else None
 
                 browser.close()
-                return html_content, status_code
+                return html_content, status_code, final_url, redirect_chain_info
 
         except Exception as e:
             print(f" Error fetching {url}: {e}")
-            return None, None
+            return None, None, None, []
+        
+    def initialize_homepage_urls(self):
+        domain_docs = self.domains_collection.find({})
+
+        for domain in domain_docs:
+            homepage = domain["url"].strip().lower()
+            homepage_hash = generate_md5(homepage)
+
+            # Only insert if it's not already in the collection
+            existing = self.urls_collection.find_one({"md5_url": homepage_hash})
+            if not existing:
+                self.urls_collection.insert_one({
+                    "url": homepage,
+                    "md5_url": homepage_hash,
+                    "domain_id": domain["_id"],
+                    "status": "pending"
+                })
+                print(f"✅ Homepage URL added: {homepage}")
+            else:
+                print(f"⚠️ Homepage already exists: {homepage}")
 
     def get_url_list_last_crawled_48hrs_before(self, num_of_urls=100):
         """Retrieve and lock URLs atomically to prevent duplicate pickups."""
@@ -47,8 +97,9 @@ class URLHandler:
                     {"last_crawled": {"$exists": False}},    # Never crawled
                     {"last_crawled": {"$lt": cutoff_time}},  #  Not crawled in 48+ hours
                     {"status": {"$exists": False}},          # No status
-                    {"status": {"$in": ["pending", "", "completed"]}} 
+                    {"status": {"$in": ["pending", "","completed"]}} 
                 ],
+                "domain_id": {"$ne": 0}
             },
             {"_id": 1}  # Fetch only required fields
             ).sort({ "last_crawled": 1 }).limit(num_of_urls))
@@ -92,9 +143,8 @@ class URLHandler:
         for url_data in locked_url_find:
                 self.process_url(url_data)
 
-
     def process_url(self, url):
-        html_content,status_code = self.fetch_html(url["url"])
+        html_content, status_code, final_url, redirect_chain = self.fetch_html(url["url"])
         if html_content:
             emails = Extractor.extract_email(html_content)
             names = Extractor.extract_names(html_content)
@@ -109,7 +159,7 @@ class URLHandler:
             for link in extracted_links["external"]:
                 print(link)
             self.store_extracted_links(extracted_links["internal"], url)
-            self.store_extracted_links(extracted_links["external"], url)
+            #self.store_extracted_links(extracted_links["external"], url)
             
               # Update the URL status to 'completed' after processing
             self.urls_collection.update_one(
@@ -120,9 +170,11 @@ class URLHandler:
                     "locked_at": None,
                     "locked_by": None,
                     "html_content":html_content,
-                    "Status_code":status_code,
+                    "status_code": status_code,
+                    "final_url": final_url,
+                    "redirect_chain": redirect_chain,
                     "emails": list(set(emails)),
-                    "company_names": names["organization"]
+                    "person_names": names["person_names"]
                 }}
             )
             print(f" Successfully processed and completed URL: {url['url']}")
@@ -134,7 +186,9 @@ class URLHandler:
                     "status": "completed",
                     "status_code": status_code,
                     "locked_at": None,
-                    "locked_by": None
+                    "final_url": None,
+                    "locked_by": None,
+                    "redirect_chain": redirect_chain
                 }}
             )
 
@@ -151,9 +205,7 @@ class URLHandler:
             if is_internal:
                 domain_id = url["domain_id"]
             else:
-                # Look up the domain_id from the domain collection
-                domain_doc = self.domains_collection.find_one({"normalized_domain": link_domain})
-                domain_id = domain_doc["_id"] if domain_doc else 0
+                domain_id = 0
 
             link = link.strip() 
             link_hash = generate_md5(link)
@@ -165,6 +217,7 @@ class URLHandler:
                             "md5_url": link_hash,
                             "url": link,
                             "domain_id": domain_id,
+                            #"is_internal": is_internal
                         },
                     },
                     upsert=True  # This will insert the link if it's new
